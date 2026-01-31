@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.autograd as autograd
 import logging
 
+import torch
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -411,19 +412,15 @@ def train(
     solid_center=(0.5, 0.5),
     solid_radius=0.15,
     print_every=200,
+    plot_every=10,          # <-- جدید: هر چند epoch نمودار آپدیت شود
     w_f=1.0, w_s=1.0, w_c=1.0, w_bc=1.0, w_ic=1.0,
-    epsJ=1e-6
+    epsJ=1e-6,
+    live_plot=True          # <-- جدید
 ):
     logger.info("=" * 60)
     logger.info("STARTING TRAINING")
     logger.info("=" * 60)
-    logger.info(f"Training configuration:")
-    logger.info(f"  Epochs: {epochs}")
-    logger.info(f"  Fluid points (N_f): {N_f}")
-    logger.info(f"  Solid points (N_s): {N_s}")
-    logger.info(f"  Learning rate: {lr}")
-    logger.info(f"  Loss weights - Fluid: {w_f}, Solid: {w_s}, Coupling: {w_c}, BC: {w_bc}, IC: {w_ic}")
-    
+
     fluid_net = FluidPINN().to(device)
     solid_net = SolidPINN().to(device)
 
@@ -431,23 +428,29 @@ def train(
         list(fluid_net.parameters()) + list(solid_net.parameters()),
         lr=lr
     )
-    logger.info("Networks created and optimizer initialized")
+
     loss_history = []
 
+    # ---- live plot setup ----
+    if live_plot:
+        plt.ion()
+        fig, ax = plt.subplots()
+        line, = ax.plot([], [])
+        ax.set_yscale("log")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Total Loss")
+        ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+        fig.canvas.draw()
+        fig.show()
 
-    for epoch in range(1, epochs+1):
-        # sample points
-        logger.debug(f"Epoch {epoch}/{epochs} - Sampling points")
+    for epoch in range(1, epochs + 1):
         x_f, y_f, t_f = sample_uniform(N_f, device)
         x_s, y_s, t_s = sample_solid_points(N_s, device, center=solid_center, radius=solid_radius)
 
-        # enable gradients w.r.t. coordinates for PINN derivatives
-        logger.debug(f"Epoch {epoch}/{epochs} - Enabling gradients")
         for z in (x_f, y_f, t_f, x_s, y_s, t_s):
             z.requires_grad_(True)
 
         opt.zero_grad()
-        logger.debug(f"Epoch {epoch}/{epochs} - Computing loss")
 
         L = total_loss(
             fluid_net, solid_net,
@@ -460,21 +463,36 @@ def train(
             epsJ=epsJ
         )
 
-        loss_history.append(L.item())
+        loss_history.append(float(L.detach().cpu().item()))
 
-
-        logger.debug(f"Epoch {epoch}/{epochs} - Backpropagation")
         L.backward()
-        logger.debug(f"Epoch {epoch}/{epochs} - Optimizer step")
         opt.step()
 
+        # ---- print ----
         if epoch % print_every == 0:
-            logger.info(f"Epoch {epoch:6d}/{epochs} | Loss: {L.item():.6e}")
-            logger.debug(f"Epoch {epoch}/{epochs} - Loss components calculated")
+            logger.info(f"Epoch {epoch:6d}/{epochs} | Loss: {loss_history[-1]:.6e}")
+
+        # ---- live plot update ----
+        if live_plot and (epoch % plot_every == 0 or epoch == 1):
+            xs = np.arange(1, len(loss_history) + 1)
+            line.set_data(xs, loss_history)
+            ax.set_xlim(1, max(10, len(loss_history)))
+            # y-limit اتومات (با کمی حاشیه)
+            ymin = min(loss_history)
+            ymax = max(loss_history)
+            if ymin > 0 and ymax > 0:
+                ax.set_ylim(ymin * 0.9, ymax * 1.1)
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+
+    if live_plot:
+        plt.ioff()
+        plt.show()
 
     logger.info("=" * 60)
     logger.info("TRAINING COMPLETED")
     logger.info("=" * 60)
+
     return fluid_net, solid_net, loss_history
 
 
@@ -482,92 +500,6 @@ def train(
 
 
 
-
-def make_plots(
-    run_dir: str,
-    fluid_net,
-    solid_net,
-    device,
-    t_list=(0.25, 0.5, 0.75),
-    N=150,
-):
-    plot_dir = os.path.join(run_dir, "plots")
-    os.makedirs(plot_dir, exist_ok=True)
-    logger.info(f"Saving plots to: {plot_dir}")
-
-    # ---- loss curve (optional) ----
-    loss_path = os.path.join(run_dir, "loss.npy")
-    if os.path.exists(loss_path):
-        loss_history = np.load(loss_path)
-        plt.figure()
-        plt.semilogy(loss_history)
-        plt.xlabel("Epoch")
-        plt.ylabel("Total Loss")
-        plt.title("Training Loss")
-        plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-        plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, "loss.png"), dpi=300)
-        plt.close()
-    else:
-        logger.warning(f"No loss.npy found in {run_dir}; skipping loss plot.")
-
-    # ---- field snapshots ----
-    fluid_net.eval()
-    solid_net.eval()
-
-    x = torch.linspace(0, 1, N, device=device)
-    y = torch.linspace(0, 1, N, device=device)
-    X, Y = torch.meshgrid(x, y, indexing="ij")
-
-    xv = X.reshape(-1, 1)
-    yv = Y.reshape(-1, 1)
-
-    Xnp = X.detach().cpu().numpy()
-    Ynp = Y.detach().cpu().numpy()
-
-    for t0 in t_list:
-        tv = (float(t0) * torch.ones_like(xv)).to(device)
-
-        with torch.no_grad():
-            u, v, p = fluid_net(xv, yv, tv)
-            dx, dy = solid_net(xv, yv, tv)
-
-        U = u.reshape(N, N).detach().cpu().numpy()
-        V = v.reshape(N, N).detach().cpu().numpy()
-        P = p.reshape(N, N).detach().cpu().numpy()
-        DX = dx.reshape(N, N).detach().cpu().numpy()
-        DY = dy.reshape(N, N).detach().cpu().numpy()
-        SPEED = np.sqrt(U**2 + V**2)
-
-        def save_contour(Z, name, title):
-            plt.figure()
-            plt.contourf(Xnp, Ynp, Z, 50)
-            plt.colorbar()
-            plt.title(title)
-            plt.xlabel("x"); plt.ylabel("y")
-            plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, name), dpi=300)
-            plt.close()
-
-        save_contour(U,  f"u_t{t0}.png",     f"Fluid velocity u(x,y,t={t0})")
-        save_contour(V,  f"v_t{t0}.png",     f"Fluid velocity v(x,y,t={t0})")
-        save_contour(SPEED, f"speed_t{t0}.png", f"Speed magnitude |u|(x,y,t={t0})")
-        save_contour(P,  f"p_t{t0}.png",     f"Pressure p(x,y,t={t0})")
-        save_contour(DX, f"dx_t{t0}.png",    f"Solid displacement dx(x,y,t={t0})")
-        save_contour(DY, f"dy_t{t0}.png",    f"Solid displacement dy(x,y,t={t0})")
-
-        # optional quiver
-        step = max(N // 25, 1)
-        plt.figure()
-        plt.quiver(Xnp[::step, ::step], Ynp[::step, ::step],
-                   U[::step, ::step],   V[::step, ::step])
-        plt.title(f"Velocity vectors (u,v) at t={t0}")
-        plt.xlabel("x"); plt.ylabel("y")        plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, f"quiver_t{t0}.png"), dpi=300)
-        plt.close()
-
-    logger.info(f"Plots saved in: {plot_dir}")
-    return plot_dir
 
 
 def save_run(run_dir, fluid_net, solid_net, loss_history):
@@ -607,6 +539,11 @@ if __name__ == "__main__":
         solid_center=(0.5, 0.5),
         solid_radius=0.15,
         print_every=200,
+
+        # --- new for continuous loss view ---
+        plot_every=10,     
+        live_plot=True,
+
         w_f=1.0, w_s=1.0, w_c=1.0, w_bc=1.0, w_ic=1.0,
         epsJ=1e-6
     )
@@ -616,12 +553,3 @@ if __name__ == "__main__":
     save_run(run_dir=run_dir, fluid_net=fluid_net, solid_net=solid_net, loss_history=loss_history)
 
     logger.info("Script completed successfully")
-    
-
-
-# Use this when Plotting is needed
-# if __name__ == "__main__":
-#     run_dir = "runs/20260129-133424" 
-#     fluid_net, solid_net = load_run(run_dir, device=device)
-#     make_plots(run_dir, fluid_net, solid_net, device=device)
-#     logger.info(f"Plotted from existing run: {run_dir}")
