@@ -10,7 +10,10 @@
 #   * Force coupling: inject f_solid as body force into Navier–Stokes (masked by chi)
 # - Includes essential solid IC and J-positivity penalty
 # =========================================================
-
+import os
+import time
+import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.autograd as autograd
@@ -28,6 +31,9 @@ logger.info(f"Using device: {device}")
 
 # -------------------------
 # MLP Network
+# Dieses MLP (Fully-Connected Neural Network) erzeugt aus der Liste "layers" automatisch mehrere Linear-Schichten.
+# In forward() wird nach jeder Schicht (außer der letzten) die Aktivierungsfunktion tanh angewendet.
+# Die letzte Schicht bleibt ohne Aktivierung, damit die Ausgaben (z.B. u,v,p oder dx,dy) unbeschränkt bleiben.
 # -------------------------
 class MLP(nn.Module):
     def __init__(self, layers):
@@ -86,11 +92,18 @@ def chi_solid(x, y, t=None, center=(0.5, 0.5), radius=0.15):
 # =========================================================
 # Solid kinematics and Neo-Hookean PK1
 # =========================================================
+# Berechnet die Festkörpergeschwindigkeit aus dem Verschiebungsfeld:
+# u_s = ∂dx/∂t und v_s = ∂dy/∂t (Ableitungen nach der Zeit t via Autograd),
+# damit man die Geschwindigkeits-Kopplung u_f = u_s im Solid erzwingen kann.
+
 def solid_velocity(dx, dy, t):
     # u_s = d(dx)/dt , v_s = d(dy)/dt
     u_s = autograd.grad(dx, t, torch.ones_like(dx), create_graph=True)[0]
     v_s = autograd.grad(dy, t, torch.ones_like(dy), create_graph=True)[0]
     return u_s, v_s
+
+# Berechnet den Deformationsgradienten F = I + ∇d aus dem Verschiebungsfeld.
+# Dazu werden die räumlichen Ableitungen von dx und dy nach x und y gebildet.
 
 def deformation_gradient(dx, dy, x, y):
     # F = I + grad(d)
@@ -104,6 +117,10 @@ def deformation_gradient(dx, dy, x, y):
     F21 = dy_x
     F22 = 1.0 + dy_y
     return F11, F12, F21, F22
+# Berechnet den ersten Piola-Kirchhoff-Spannungstensor (PK1)
+# für ein kompressibles Neo-Hookean-Material.
+# Grundlage ist der Deformationsgradient F sowie dessen Determinante J.
+# Die Spannungen werden rein physikbasiert aus dem Verschiebungsfeld bestimmt.
 
 def neo_hookean_PK1(dx, dy, x, y, mu=1.0, lam=1.0, epsJ=1e-6):
     """
@@ -133,6 +150,8 @@ def neo_hookean_PK1(dx, dy, x, y, mu=1.0, lam=1.0, epsJ=1e-6):
     P22 = mu*(F22 - FinvT22) + lam*logJ*FinvT22
 
     return (P11, P12, P21, P22, J)
+# Berechnet die innere Festkörperkraft als Divergenz des PK1-Spannungstensors:
+# f = ∇·P, wobei die Ableitungen nach x und y mittels Autograd bestimmt werden.
 
 def solid_internal_force_PK1(P11, P12, P21, P22, x, y):
     """
@@ -146,6 +165,10 @@ def solid_internal_force_PK1(P11, P12, P21, P22, x, y):
     fy = autograd.grad(P21, x, torch.ones_like(P21), create_graph=True)[0] + \
          autograd.grad(P22, y, torch.ones_like(P22), create_graph=True)[0]
     return fx, fy
+
+# Fasst die Festkörperphysik zusammen:
+# Berechnet aus dem Verschiebungsfeld die Neo-Hookean-Spannungen (PK1),
+# bestimmt daraus die innere Kraft f = ∇·P und gibt zusätzlich die Determinante J zurück.
 
 def compute_solid_force(dx, dy, x, y, mu=1.0, lam=1.0, epsJ=1e-6):
     P11, P12, P21, P22, J = neo_hookean_PK1(dx, dy, x, y, mu=mu, lam=lam, epsJ=epsJ)
@@ -228,17 +251,60 @@ def loss_ic_solid(solid_net, N=500):
     dx, dy = solid_net(x, y, t)
     return torch.mean(dx**2 + dy**2)
 
-# -------------------------
+# --HELP, what is my real BC/IC?
+# ----------------------
 # Optional: fluid BC/IC placeholders
-# Replace with your real constraints
+# Replace with my real constraints
 # -------------------------
-def loss_bc_ic(fluid_net, solid_net):
+def loss_bc_ic(fluid_net, solid_net, N=500):
+    # دیواره پایین y=0
+    x = torch.rand(N, 1, device=device)
+    y = torch.zeros(N, 1, device=device)
+    t = torch.rand(N, 1, device=device)
+    x.requires_grad_(True)
+    y.requires_grad_(True)
+    t.requires_grad_(True)
+
+    u, v, _ = fluid_net(x, y, t)
+    L_wall_bottom = torch.mean(u**2 + v**2)
+
+    # دیواره بالا y=1
+    y = torch.ones(N, 1, device=device)
+    y.requires_grad_(True)
+    u, v, _ = fluid_net(x, y, t)
+    L_wall_top = torch.mean(u**2 + v**2)
+
+    # ورودی x=0
+    x = torch.zeros(N, 1, device=device)
+    y = torch.rand(N, 1, device=device)
+    t = torch.rand(N, 1, device=device)
+    x.requires_grad_(True)
+    y.requires_grad_(True)
+    t.requires_grad_(True)
+
+    u, v, _ = fluid_net(x, y, t)
+    L_inlet = torch.mean((u - 1.0)**2 + v**2)
+
+    # شرط اولیه t=0
+    x = torch.rand(N, 1, device=device)
+    y = torch.rand(N, 1, device=device)
+    t = torch.zeros(N, 1, device=device)
+    x.requires_grad_(True)
+    y.requires_grad_(True)
+    t.requires_grad_(True)
+
+    u, v, _ = fluid_net(x, y, t)
+    L_ic = torch.mean(u**2 + v**2)
+
+    
+    return L_wall_bottom + L_wall_top + L_inlet + L_ic
+#def loss_bc_ic(fluid_net, solid_net):
     # Example placeholders:
     # - No-slip at outer boundary
     # - Inlet velocity profile
     # - Pressure outlet
     # - Fluid initial condition
-    return torch.tensor(0.0, device=device)
+   # return torch.tensor(0.0, device=device)
 
 # =========================================================
 # TOTAL LOSS
@@ -366,6 +432,8 @@ def train(
         lr=lr
     )
     logger.info("Networks created and optimizer initialized")
+    loss_history = []
+
 
     for epoch in range(1, epochs+1):
         # sample points
@@ -392,6 +460,9 @@ def train(
             epsJ=epsJ
         )
 
+        loss_history.append(L.item())
+
+
         logger.debug(f"Epoch {epoch}/{epochs} - Backpropagation")
         L.backward()
         logger.debug(f"Epoch {epoch}/{epochs} - Optimizer step")
@@ -404,13 +475,126 @@ def train(
     logger.info("=" * 60)
     logger.info("TRAINING COMPLETED")
     logger.info("=" * 60)
+    return fluid_net, solid_net, loss_history
+
+
+
+
+
+
+
+def make_plots(
+    run_dir: str,
+    fluid_net,
+    solid_net,
+    device,
+    t_list=(0.25, 0.5, 0.75),
+    N=150,
+):
+    plot_dir = os.path.join(run_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    logger.info(f"Saving plots to: {plot_dir}")
+
+    # ---- loss curve (optional) ----
+    loss_path = os.path.join(run_dir, "loss.npy")
+    if os.path.exists(loss_path):
+        loss_history = np.load(loss_path)
+        plt.figure()
+        plt.semilogy(loss_history)
+        plt.xlabel("Epoch")
+        plt.ylabel("Total Loss")
+        plt.title("Training Loss")
+        plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+        plt.tight_layout()
+        plt.savefig(os.path.join(plot_dir, "loss.png"), dpi=300)
+        plt.close()
+    else:
+        logger.warning(f"No loss.npy found in {run_dir}; skipping loss plot.")
+
+    # ---- field snapshots ----
+    fluid_net.eval()
+    solid_net.eval()
+
+    x = torch.linspace(0, 1, N, device=device)
+    y = torch.linspace(0, 1, N, device=device)
+    X, Y = torch.meshgrid(x, y, indexing="ij")
+
+    xv = X.reshape(-1, 1)
+    yv = Y.reshape(-1, 1)
+
+    Xnp = X.detach().cpu().numpy()
+    Ynp = Y.detach().cpu().numpy()
+
+    for t0 in t_list:
+        tv = (float(t0) * torch.ones_like(xv)).to(device)
+
+        with torch.no_grad():
+            u, v, p = fluid_net(xv, yv, tv)
+            dx, dy = solid_net(xv, yv, tv)
+
+        U = u.reshape(N, N).detach().cpu().numpy()
+        V = v.reshape(N, N).detach().cpu().numpy()
+        P = p.reshape(N, N).detach().cpu().numpy()
+        DX = dx.reshape(N, N).detach().cpu().numpy()
+        DY = dy.reshape(N, N).detach().cpu().numpy()
+        SPEED = np.sqrt(U**2 + V**2)
+
+        def save_contour(Z, name, title):
+            plt.figure()
+            plt.contourf(Xnp, Ynp, Z, 50)
+            plt.colorbar()
+            plt.title(title)
+            plt.xlabel("x"); plt.ylabel("y")
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, name), dpi=300)
+            plt.close()
+
+        save_contour(U,  f"u_t{t0}.png",     f"Fluid velocity u(x,y,t={t0})")
+        save_contour(V,  f"v_t{t0}.png",     f"Fluid velocity v(x,y,t={t0})")
+        save_contour(SPEED, f"speed_t{t0}.png", f"Speed magnitude |u|(x,y,t={t0})")
+        save_contour(P,  f"p_t{t0}.png",     f"Pressure p(x,y,t={t0})")
+        save_contour(DX, f"dx_t{t0}.png",    f"Solid displacement dx(x,y,t={t0})")
+        save_contour(DY, f"dy_t{t0}.png",    f"Solid displacement dy(x,y,t={t0})")
+
+        # optional quiver
+        step = max(N // 25, 1)
+        plt.figure()
+        plt.quiver(Xnp[::step, ::step], Ynp[::step, ::step],
+                   U[::step, ::step],   V[::step, ::step])
+        plt.title(f"Velocity vectors (u,v) at t={t0}")
+        plt.xlabel("x"); plt.ylabel("y")        plt.tight_layout()
+        plt.savefig(os.path.join(plot_dir, f"quiver_t{t0}.png"), dpi=300)
+        plt.close()
+
+    logger.info(f"Plots saved in: {plot_dir}")
+    return plot_dir
+
+
+def save_run(run_dir, fluid_net, solid_net, loss_history):
+    os.makedirs(run_dir, exist_ok=True)
+    torch.save(fluid_net.state_dict(), os.path.join(run_dir, "fluid_net.pth"))
+    torch.save(solid_net.state_dict(), os.path.join(run_dir, "solid_net.pth"))
+    np.save(os.path.join(run_dir, "loss.npy"), np.array(loss_history, dtype=np.float64))
+    logger.info(f"Saved model and loss history in: {run_dir}")
+
+def load_run(run_dir, device):
+    # IMPORTANT: build the networks with the SAME architecture as training
+    fluid_net = FluidPINN().to(device)
+    solid_net = SolidPINN().to(device)
+
+    fluid_net.load_state_dict(torch.load(os.path.join(run_dir, "fluid_net.pth"), map_location=device))
+    solid_net.load_state_dict(torch.load(os.path.join(run_dir, "solid_net.pth"), map_location=device))
+
+    fluid_net.eval()
+    solid_net.eval()
     return fluid_net, solid_net
 
 
+# Use this when training is needed
 if __name__ == "__main__":
-    # Example run
     logger.info("Script started")
-    fluid_net, solid_net = train(
+
+    fluid_net, solid_net, loss_history = train(
         epochs=2000,
         N_f=2000,
         N_s=1000,
@@ -426,4 +610,18 @@ if __name__ == "__main__":
         w_f=1.0, w_s=1.0, w_c=1.0, w_bc=1.0, w_ic=1.0,
         epsJ=1e-6
     )
+    
+    
+    run_dir = os.path.join("runs", time.strftime("%Y%m%d-%H%M%S"))
+    save_run(run_dir=run_dir, fluid_net=fluid_net, solid_net=solid_net, loss_history=loss_history)
+
     logger.info("Script completed successfully")
+    
+
+
+# Use this when Plotting is needed
+# if __name__ == "__main__":
+#     run_dir = "runs/20260129-133424" 
+#     fluid_net, solid_net = load_run(run_dir, device=device)
+#     make_plots(run_dir, fluid_net, solid_net, device=device)
+#     logger.info(f"Plotted from existing run: {run_dir}")
